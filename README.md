@@ -1,13 +1,11 @@
 # socks5ssh
 
 `socks5ssh` forwards socks5 proxy traffic through SSH tunnels. 
-Single static binary, event-driven architecture, supports multiple simultaneous tunnels.
 
 ## Features
 
 - **Multiple tunnels** — each tunnel gets its own SSH connection and local SOCKS5 port
 - **Event-driven I/O** — `ssh_get_fd()` + epoll integration, near-zero idle CPU
-- **Static binary** — single ~7MB executable, no runtime dependencies
 - **Auto-reconnect** — configurable retry count per tunnel
 - **Legacy SSH support** — connects to OpenSSH 5.x+ (3des-cbc, blowfish-cbc, diffie-hellman-group1-sha1, ssh-dss)
 - **Backpressure** — SSH read pauses while client write is pending
