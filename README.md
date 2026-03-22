@@ -138,13 +138,3 @@ Supports modern and legacy servers (OpenSSH 5.x+):
 | Cipher | chacha20-poly1305, aes*-gcm, aes*-ctr, aes*-cbc, 3des-cbc, blowfish-cbc |
 | MAC | hmac-sha2-*-etm, umac-*-etm, hmac-sha2-*, hmac-sha1, hmac-md5 |
 | HostKey | ssh-ed25519, ecdsa-sha2-nistp256, ssh-rsa, ssh-dss |
-
-## Dependencies
-
-| Library | Version | Purpose |
-|---------|---------|---------|
-| [libssh](https://www.libssh.org) | 0.12.0 | SSH protocol |
-| [Boost.Asio](https://www.boost.org) | 1.74+ | Async I/O |
-| [OpenSSL](https://www.openssl.org) | 3.x | Crypto backend |
-| [nlohmann/json](https://github.com/nlohmann/json) | 3.x | Config parsing |
-| zlib | — | SSH compression |
