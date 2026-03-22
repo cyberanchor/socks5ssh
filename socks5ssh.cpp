@@ -76,8 +76,6 @@
  *   make debug     — for -d/-T logging (ASan + UBSan)
  *   make release   — production (debug/trace compiled out)
  *
- * @copyright 2024-2025
- * @license MIT
  */
 
 #define LIBSSH_STATIC 1
