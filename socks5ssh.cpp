@@ -1,18 +1,32 @@
 /**
  * @file socks5ssh.cpp
  * @brief SOCKS5 Proxy over SSH — Event-Driven, Full Diagnostics
- * @version 3.2.1
+ * @version 3.2.4
  *
  * High-performance SOCKS5 proxy forwarding traffic through SSH tunnels.
  * Uses ssh_get_fd() integrated with boost::asio for event-driven I/O.
  * Single fd watcher per tunnel eliminates thundering herd.
  * All libssh calls serialized through strand (no mutex for SSH ops).
  *
+ * @section Changes_v3_2_4
+ *   - Fix: destroy() invalidates all session channels before ssh_free()
+ *     (prevents Use-After-Free/segfault when SSH server crashes)
+ *   - Disconnected sessions are closed immediately (no zombie clients)
+ *
+ * @section Changes_v3_2_3
+ *   - Fix: pump_ssh() detects SSH disconnect, destroys watcher
+ *     (prevents 100% CPU spin loop on server crash/EOF)
+ *   - Fix: signal handler uses write() instead of Log::info()
+ *     (eliminates async-signal-unsafe mutex deadlock on Ctrl+C)
+ *
+ * @section Changes_v3_2_2
+ *   - Security: bind_ip config field, default 127.0.0.1 (no open proxy)
+ *   - Fix: TCP Keep-Alive enabled (prevents NAT timeout zombie sessions)
+ *   - Removed: SIGHUP handler (async-signal-unsafe, deadlock risk)
+ *
  * @section Changes_v3_2_1
- *   - Fix: bytes_up_/bytes_down_ use atomic fetch_add + load with
- *     memory_order_relaxed (eliminates data race UB per C++ standard)
+ *   - Fix: bytes_up_/bytes_down_ atomic with memory_order_relaxed
  *   - Fix: dup'd fd gets FD_CLOEXEC to prevent leak on fork+exec
- *   - Feature: SIGHUP handler reopens log file (logrotate support)
  *
  * @section Changes_v3_2
  *   - 5-level logging: ERROR, WARN, INFO, DEBUG, TRACE
@@ -92,7 +106,7 @@ using json = nlohmann::json;
 // =============================================================================
 
 static constexpr const char* APP_NAME    = "socks5proxy";
-static constexpr const char* APP_VERSION = "3.2.1";
+static constexpr const char* APP_VERSION = "3.2.4";
 
 /** @brief Relay buffer size per direction (client↔SSH). */
 static constexpr std::size_t RELAY_BUF = 32768;
@@ -254,6 +268,7 @@ struct TunnelConfig {
     std::string    host;           ///< SSH server hostname or IP
     std::string    username;       ///< SSH username
     std::string    password;       ///< SSH password
+    std::string    bind_ip = "127.0.0.1"; ///< Local bind address (default: loopback only)
     int            port = 22;      ///< SSH server port
     int            max_reconnects = MAX_RECONN_DEF;  ///< Max reconnection attempts
     int            ssh_timeout = SSH_TIMEOUT_DEF;     ///< SSH connect timeout (seconds)
@@ -317,11 +332,13 @@ bool read_config(const std::string& path, std::vector<TunnelConfig>& out) {
                 c.max_reconnects = it["max_reconnects"].get<int>();
             if (it.contains("ssh_timeout") && it["ssh_timeout"].is_number_integer())
                 c.ssh_timeout = it["ssh_timeout"].get<int>();
+            if (it.contains("bind_ip") && it["bind_ip"].is_string())
+                c.bind_ip = it["bind_ip"].get<std::string>();
 
             out.push_back(std::move(c));
             Log::dbg("Config: tunnel '", out.back().name, "' → ",
                      out.back().username, "@", out.back().host, ":", out.back().port,
-                     " local:", out.back().local_port);
+                     " bind:", out.back().bind_ip, ":", out.back().local_port);
         }
     } catch (const json::parse_error& e) {
         Log::err("JSON parse error: ", e.what());
@@ -353,6 +370,9 @@ public:
     virtual ~ISessionNotify() = default;
     /** @brief Called on ssh_strand_ when SSH data may be available. */
     virtual void notify_data_ready() = 0;
+    /** @brief Called on ssh_strand_ when SSH session is being destroyed.
+     *  Nullifies channel pointer before ssh_free() to prevent Use-After-Free. */
+    virtual void invalidate_channel() = 0;
 };
 
 // =============================================================================
@@ -600,6 +620,10 @@ private:
         // --- No compression ---
         if (!opt(SSH_OPTIONS_COMPRESSION, "none")) return false;
 
+        // --- TCP Keep-Alive (prevents NAT timeout drops) ---
+        int keepalive = 1;
+        if (!opt(SSH_OPTIONS_TCP_KEEPALIVE, &keepalive)) return false;
+
         // --- Connect ---
         if (ssh_connect(session_) != SSH_OK) {
             Log::err(cfg_.name, ": Connect: ", ssh_get_error(session_));
@@ -710,6 +734,15 @@ private:
             fd_desc_->close(ec);
             fd_desc_.reset();
         }
+
+        // Invalidate all session channels BEFORE ssh_free().
+        // ssh_free() internally frees all associated ssh_channel memory.
+        // Without this, sessions hold dangling ch_ pointers → Use-After-Free.
+        for (auto* s : sessions_) {
+            s->invalidate_channel();
+        }
+        channels_ = 0;
+
         if (session_) {
             if (ssh_is_connected(session_)) {
                 Log::dbg(cfg_.name, ": Disconnecting SSH session...");
@@ -834,6 +867,15 @@ private:
             ssh_event_free(ev);
         }
 
+        // Check if SSH session died after polling (EOF/RST from server).
+        // Without this check, fd stays in EOF state, epoll returns readable
+        // immediately, and we spin at 100% CPU forever.
+        if (!ssh_is_connected(session_)) {
+            Log::warn(cfg_.name, ": SSH disconnected (detected in pump_ssh). Destroying watcher.");
+            destroy();
+            return;
+        }
+
         // Broadcast: notify all sessions that data may be available
         for (auto* s : sessions_) {
             s->notify_data_ready();
@@ -921,6 +963,16 @@ public:
             if (closed_.load() || write_pending_.load()) return;
             do_drain();
         });
+    }
+
+    /**
+     * @brief Called by SSHManager::destroy() on ssh_strand_ before ssh_free().
+     * Nullifies channel pointer (ssh_free will free the underlying memory)
+     * and triggers session close to disconnect the client immediately.
+     */
+    void invalidate_channel() override {
+        ch_ = nullptr;
+        do_close();
     }
 
 private:
@@ -1326,7 +1378,8 @@ class Socks5Proxy {
 public:
     Socks5Proxy(boost::asio::io_context& ioc, const TunnelConfig& cfg)
         : ioc_(ioc)
-        , acceptor_(ioc, tcp::endpoint(tcp::v4(), cfg.local_port))
+        , acceptor_(ioc, tcp::endpoint(
+              boost::asio::ip::make_address(cfg.bind_ip), cfg.local_port))
         , ssh_(std::make_shared<SSHManager>(cfg, ioc))
         , name_(cfg.name)
     {
@@ -1363,26 +1416,12 @@ private:
 
 static std::atomic<bool> g_run{true};
 
-/** @brief Path to log file for SIGHUP reopen (log rotation support). */
-static std::string g_log_path;
-
-static void on_sig(int s) {
-    Log::info("Signal ", s, " — shutting down...");
+static void on_sig([[maybe_unused]] int s) {
+    // Only async-signal-safe operations here.
+    // write() is safe; Log::info (mutex + iostream) is NOT.
+    static const char msg[] = "\n[SIGNAL] Shutting down...\n";
+    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
     g_run.store(false);
-}
-
-/**
- * @brief SIGHUP handler — reopen log file for log rotation.
- *
- * Allows logrotate to rename the old file and send SIGHUP,
- * after which the process creates a new file at the original path.
- */
-static void on_sighup([[maybe_unused]] int s) {
-    if (g_log_path.empty()) return;
-    if (g_logfile.is_open()) g_logfile.close();
-    g_logfile.open(g_log_path, std::ios::app);
-    if (g_logfile.is_open())
-        Log::info("Log file reopened (SIGHUP).");
 }
 
 // =============================================================================
@@ -1454,6 +1493,7 @@ static void print_help(const char* prog) {
 "    local_port     int      Local port for the SOCKS5 listener\n"
 "\n"
 "  Optional fields:\n"
+"    bind_ip        string   Local bind address (default: 127.0.0.1)\n"
 "    max_reconnects int      Max reconnection attempts on disconnect (default: 5)\n"
 "    ssh_timeout    int      SSH connect timeout in seconds (default: 10)\n"
 "\n"
@@ -1596,7 +1636,6 @@ int main(int argc, char* argv[]) {
 
     // Open log file if requested
     if (!app.log_file.empty()) {
-        g_log_path = app.log_file;
         g_logfile.open(app.log_file, std::ios::app);
         if (!g_logfile.is_open()) {
             std::cerr << "Cannot open log file: " << app.log_file << "\n";
@@ -1629,7 +1668,6 @@ int main(int argc, char* argv[]) {
     // Install signal handlers
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
-    std::signal(SIGHUP, on_sighup);
 
     try {
         boost::asio::io_context ioc;
@@ -1641,7 +1679,7 @@ int main(int argc, char* argv[]) {
             auto p = std::make_shared<Socks5Proxy>(ioc, t);
             p->start();
             proxies.push_back(p);
-            Log::info(t.name, ": SOCKS5 listening on 0.0.0.0:", t.local_port);
+            Log::info(t.name, ": SOCKS5 listening on ", t.bind_ip, ":", t.local_port);
         }
 
         // Thread pool
