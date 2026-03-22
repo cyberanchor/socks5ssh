@@ -1,12 +1,19 @@
 /**
  * @file socks5ssh.cpp
  * @brief SOCKS5 Proxy over SSH — Event-Driven, Full Diagnostics
- * @version 3.2.5
+ * @version 3.2.6
  *
  * High-performance SOCKS5 proxy forwarding traffic through SSH tunnels.
  * Uses ssh_get_fd() integrated with boost::asio for event-driven I/O.
  * Single fd watcher per tunnel eliminates thundering herd.
  * All libssh calls serialized through strand (no mutex for SSH ops).
+ *
+ * @section Changes_v3_2_6
+ *   - Fix: TCP Keep-Alive via setsockopt (SSH_OPTIONS_TCP_KEEPALIVE
+ *     does not exist in libssh 0.12.0; now sets SO_KEEPALIVE +
+ *     TCP_KEEPIDLE=60s + TCP_KEEPINTVL=15s + TCP_KEEPCNT=4 on SSH fd)
+ *   - Fix: destroy() accessible via public shutdown() for graceful stop
+ *   - Fix: GCC warn_unused_result on write() in signal handler
  *
  * @section Changes_v3_2_5
  *   - Fix: graceful shutdown via stop() instead of ioc.stop()
@@ -103,6 +110,8 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 
 using boost::asio::ip::tcp;
 using json = nlohmann::json;
@@ -112,7 +121,7 @@ using json = nlohmann::json;
 // =============================================================================
 
 static constexpr const char* APP_NAME    = "socks5proxy";
-static constexpr const char* APP_VERSION = "3.2.5";
+static constexpr const char* APP_VERSION = "3.2.6";
 
 /** @brief Relay buffer size per direction (client↔SSH). */
 static constexpr std::size_t RELAY_BUF = 32768;
@@ -546,6 +555,12 @@ public:
         Log::trace(cfg_.name, ": Session unregistered (total: ", sessions_.size(), ")");
     }
 
+    /**
+     * @brief Public shutdown entry point for graceful teardown.
+     * Called via post(strand_) from Socks5Proxy::stop().
+     */
+    void shutdown() { destroy(); }
+
 private:
     // ── SSH Connect (blocking) ──────────────────────────────────────────────
 
@@ -626,15 +641,33 @@ private:
         // --- No compression ---
         if (!opt(SSH_OPTIONS_COMPRESSION, "none")) return false;
 
-        // --- TCP Keep-Alive (prevents NAT timeout drops) ---
-        int keepalive = 1;
-        if (!opt(SSH_OPTIONS_TCP_KEEPALIVE, &keepalive)) return false;
-
         // --- Connect ---
         if (ssh_connect(session_) != SSH_OK) {
             Log::err(cfg_.name, ": Connect: ", ssh_get_error(session_));
             destroy();
             return false;
+        }
+
+        // --- TCP Keep-Alive on SSH socket (prevents NAT timeout drops) ---
+        {
+            int fd = static_cast<int>(ssh_get_fd(session_));
+            if (fd >= 0) {
+                int on = 1;
+                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+                int idle = 60;   // first probe after 60s idle (default: 7200s)
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+                int intvl = 15;  // probe every 15s
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+                int cnt = 4;     // give up after 4 failed probes
+                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+                Log::dbg(cfg_.name, ": TCP Keep-Alive enabled on fd ", fd);
+            }
         }
 
         // --- Print negotiated session details ---
@@ -1406,7 +1439,7 @@ public:
         acceptor_.cancel(ec);
         acceptor_.close(ec);
         boost::asio::post(ssh_->strand(), [ssh = ssh_]() {
-            ssh->destroy();
+            ssh->shutdown();
         });
     }
 
@@ -1442,7 +1475,7 @@ static void on_sig([[maybe_unused]] int s) {
     // Only async-signal-safe operations here.
     // write() is safe; Log::info (mutex + iostream) is NOT.
     static const char msg[] = "\n[SIGNAL] Shutting down...\n";
-    (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    if (::write(STDERR_FILENO, msg, sizeof(msg) - 1)) {} // suppress warn_unused_result
     g_run.store(false);
 }
 
