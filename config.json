@@ -1,0 +1,22 @@
+[
+  {
+    "name": "proxy-us",
+    "host": "203.0.113.10",
+    "port": 22,
+    "username": "tunnel",
+    "password": "your_password",
+    "local_port": 1080,
+    "max_reconnects": 5,
+    "ssh_timeout": 10
+  },
+  {
+    "name": "proxy-eu",
+    "host": "198.51.100.20",
+    "port": 2222,
+    "username": "admin",
+    "password": "your_password",
+    "local_port": 1081,
+    "max_reconnects": 10,
+    "ssh_timeout": 15
+  }
+]
