@@ -1,12 +1,18 @@
 /**
  * @file socks5ssh.cpp
  * @brief SOCKS5 Proxy over SSH — Event-Driven, Full Diagnostics
- * @version 3.2.0
+ * @version 3.2.1
  *
  * High-performance SOCKS5 proxy forwarding traffic through SSH tunnels.
  * Uses ssh_get_fd() integrated with boost::asio for event-driven I/O.
  * Single fd watcher per tunnel eliminates thundering herd.
  * All libssh calls serialized through strand (no mutex for SSH ops).
+ *
+ * @section Changes_v3_2_1
+ *   - Fix: bytes_up_/bytes_down_ use atomic fetch_add + load with
+ *     memory_order_relaxed (eliminates data race UB per C++ standard)
+ *   - Fix: dup'd fd gets FD_CLOEXEC to prevent leak on fork+exec
+ *   - Feature: SIGHUP handler reopens log file (logrotate support)
  *
  * @section Changes_v3_2
  *   - 5-level logging: ERROR, WARN, INFO, DEBUG, TRACE
@@ -43,6 +49,8 @@
  *   make debug     — for -d/-T logging (ASan + UBSan)
  *   make release   — production (debug/trace compiled out)
  *
+ * @copyright 2024-2025
+ * @license MIT
  */
 
 #define LIBSSH_STATIC 1
@@ -74,6 +82,7 @@
 #include <functional>
 #include <getopt.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 using boost::asio::ip::tcp;
 using json = nlohmann::json;
@@ -83,7 +92,7 @@ using json = nlohmann::json;
 // =============================================================================
 
 static constexpr const char* APP_NAME    = "socks5proxy";
-static constexpr const char* APP_VERSION = "3.2.0";
+static constexpr const char* APP_VERSION = "3.2.1";
 
 /** @brief Relay buffer size per direction (client↔SSH). */
 static constexpr std::size_t RELAY_BUF = 32768;
@@ -769,6 +778,7 @@ private:
             Log::err(cfg_.name, ": dup() failed.");
             return;
         }
+        ::fcntl(duped, F_SETFD, FD_CLOEXEC);
 
         try {
             fd_desc_ = std::make_unique<boost::asio::posix::stream_descriptor>(ioc_, duped);
@@ -1170,8 +1180,9 @@ private:
                         do_close();
                         return;
                     }
-                    bytes_up_ += n;
-                    Log::trace(tag_, ": C→S ", n, " bytes (total up: ", fmt_bytes(bytes_up_), ")");
+                    bytes_up_.fetch_add(n, std::memory_order_relaxed);
+                    Log::trace(tag_, ": C→S ", n, " bytes (total up: ",
+                               fmt_bytes(bytes_up_.load(std::memory_order_relaxed)), ")");
 
                     auto s2 = shared_from_this();
                     boost::asio::post(ssh_->strand(), [this, s2, n]() {
@@ -1201,8 +1212,9 @@ private:
         int n = ssh_->channel_read_nb(ch_, sbuf_.data(), static_cast<uint32_t>(sbuf_.size()));
 
         if (n > 0) {
-            bytes_down_ += n;
-            Log::trace(tag_, ": S→C ", n, " bytes (total down: ", fmt_bytes(bytes_down_), ")");
+            bytes_down_.fetch_add(n, std::memory_order_relaxed);
+            Log::trace(tag_, ": S→C ", n, " bytes (total down: ",
+                       fmt_bytes(bytes_down_.load(std::memory_order_relaxed)), ")");
 
             write_pending_.store(true);
             auto self = shared_from_this();
@@ -1244,7 +1256,8 @@ private:
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(dur).count();
 
         Log::info(tag_, ": Closed — ", dst_host_, ":", dst_port_,
-                  " ↑", fmt_bytes(bytes_up_), " ↓", fmt_bytes(bytes_down_),
+                  " ↑", fmt_bytes(bytes_up_.load(std::memory_order_relaxed)),
+                  " ↓", fmt_bytes(bytes_down_.load(std::memory_order_relaxed)),
                   " ", secs, "s from ", client_addr_);
 
         auto self = shared_from_this();
@@ -1286,9 +1299,9 @@ private:
     std::atomic<bool> closed_{false};             ///< Close-once guard
     std::atomic<bool> write_pending_{false};       ///< Backpressure flag
 
-    // Transfer stats
-    uint64_t bytes_up_   = 0;                     ///< Client → SSH bytes
-    uint64_t bytes_down_ = 0;                     ///< SSH → Client bytes
+    // Transfer stats (atomic: written on different strands, read in do_close)
+    std::atomic<uint64_t> bytes_up_{0};            ///< Client → SSH bytes
+    std::atomic<uint64_t> bytes_down_{0};          ///< SSH → Client bytes
     std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
 
     // Protocol buffers
@@ -1350,9 +1363,26 @@ private:
 
 static std::atomic<bool> g_run{true};
 
+/** @brief Path to log file for SIGHUP reopen (log rotation support). */
+static std::string g_log_path;
+
 static void on_sig(int s) {
     Log::info("Signal ", s, " — shutting down...");
     g_run.store(false);
+}
+
+/**
+ * @brief SIGHUP handler — reopen log file for log rotation.
+ *
+ * Allows logrotate to rename the old file and send SIGHUP,
+ * after which the process creates a new file at the original path.
+ */
+static void on_sighup([[maybe_unused]] int s) {
+    if (g_log_path.empty()) return;
+    if (g_logfile.is_open()) g_logfile.close();
+    g_logfile.open(g_log_path, std::ios::app);
+    if (g_logfile.is_open())
+        Log::info("Log file reopened (SIGHUP).");
 }
 
 // =============================================================================
@@ -1566,6 +1596,7 @@ int main(int argc, char* argv[]) {
 
     // Open log file if requested
     if (!app.log_file.empty()) {
+        g_log_path = app.log_file;
         g_logfile.open(app.log_file, std::ios::app);
         if (!g_logfile.is_open()) {
             std::cerr << "Cannot open log file: " << app.log_file << "\n";
@@ -1598,6 +1629,7 @@ int main(int argc, char* argv[]) {
     // Install signal handlers
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
+    std::signal(SIGHUP, on_sighup);
 
     try {
         boost::asio::io_context ioc;
