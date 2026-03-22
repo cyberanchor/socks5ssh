@@ -1,6 +1,6 @@
 # socks5ssh
 
-socks5ssh forwards socks5 proxy traffic through SSH tunnels. 
+`socks5ssh` forwards socks5 proxy traffic through SSH tunnels. 
 Single static binary, event-driven architecture, supports multiple simultaneous tunnels.
 
 ## Features
@@ -13,7 +13,7 @@ Single static binary, event-driven architecture, supports multiple simultaneous 
 - **Backpressure** — SSH read pauses while client write is pending
 - **Diagnostics** — 5 log levels, SSH negotiation details, per-session transfer stats
 
-## Quick Start
+## Quick start
 
 ```bash
 # 1. Download dependencies
