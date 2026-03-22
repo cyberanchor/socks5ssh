@@ -16,6 +16,7 @@
     "username": "admin",
     "password": "your_password",
     "local_port": 1081,
+    "bind_ip": "0.0.0.0",
     "max_reconnects": 10,
     "ssh_timeout": 15
   }

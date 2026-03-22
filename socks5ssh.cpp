@@ -1,12 +1,18 @@
 /**
  * @file socks5ssh.cpp
  * @brief SOCKS5 Proxy over SSH — Event-Driven, Full Diagnostics
- * @version 3.2.4
+ * @version 3.2.5
  *
  * High-performance SOCKS5 proxy forwarding traffic through SSH tunnels.
  * Uses ssh_get_fd() integrated with boost::asio for event-driven I/O.
  * Single fd watcher per tunnel eliminates thundering herd.
  * All libssh calls serialized through strand (no mutex for SSH ops).
+ *
+ * @section Changes_v3_2_5
+ *   - Fix: graceful shutdown via stop() instead of ioc.stop()
+ *     (prevents Teardown UAF/segfault on Ctrl+C)
+ *   - Fix: SIGPIPE ignored (prevents process kill on broken client socket)
+ *   - Fix: sessions_.clear() in destroy() (prevents double-iterate on reconnect)
  *
  * @section Changes_v3_2_4
  *   - Fix: destroy() invalidates all session channels before ssh_free()
@@ -106,7 +112,7 @@ using json = nlohmann::json;
 // =============================================================================
 
 static constexpr const char* APP_NAME    = "socks5proxy";
-static constexpr const char* APP_VERSION = "3.2.4";
+static constexpr const char* APP_VERSION = "3.2.5";
 
 /** @brief Relay buffer size per direction (client↔SSH). */
 static constexpr std::size_t RELAY_BUF = 32768;
@@ -741,6 +747,7 @@ private:
         for (auto* s : sessions_) {
             s->invalidate_channel();
         }
+        sessions_.clear();
         channels_ = 0;
 
         if (session_) {
@@ -1390,6 +1397,19 @@ public:
     /** @brief Start accepting connections. */
     void start() { do_accept(); }
 
+    /**
+     * @brief Graceful shutdown: close acceptor, destroy SSH session.
+     * Called from main() before joining threads. Prevents Teardown UAF.
+     */
+    void stop() {
+        boost::system::error_code ec;
+        acceptor_.cancel(ec);
+        acceptor_.close(ec);
+        boost::asio::post(ssh_->strand(), [ssh = ssh_]() {
+            ssh->destroy();
+        });
+    }
+
 private:
     void do_accept() {
         acceptor_.async_accept(
@@ -1397,6 +1417,8 @@ private:
                 if (!ec) {
                     std::make_shared<Socks5Session>(
                         std::move(s), ioc_, ssh_, name_)->start();
+                } else if (ec == boost::asio::error::operation_aborted) {
+                    return; // acceptor closed during shutdown
                 } else {
                     Log::err(name_, ": Accept error: ", ec.message());
                 }
@@ -1666,6 +1688,7 @@ int main(int argc, char* argv[]) {
     Log::info("Loaded ", tunnels.size(), " tunnel(s) from ", app.config_file);
 
     // Install signal handlers
+    std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGINT, on_sig);
     std::signal(SIGTERM, on_sig);
 
@@ -1702,11 +1725,17 @@ int main(int argc, char* argv[]) {
         while (g_run.load())
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        // Graceful shutdown
+        // Graceful shutdown — no ioc.stop()!
+        // ioc.stop() would discard pending handlers, destroying Socks5Session
+        // objects while SSHManager still holds raw pointers → Use-After-Free.
+        // Instead: close acceptors, destroy SSH sessions, let asio drain.
         Log::info("───────────────────────────────────────────────────────");
         Log::info("Shutting down...");
-        guard.reset();
-        ioc.stop();
+
+        for (auto& p : proxies)
+            p->stop();
+
+        guard.reset();  // allow ioc.run() to return when queue empties
 
         for (auto& t : threads)
             if (t.joinable()) t.join();

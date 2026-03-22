@@ -104,9 +104,9 @@ JSON array. Each object is one SSH tunnel with its own SOCKS5 port.
 | `username` | string | yes | — | SSH user |
 | `password` | string | yes | — | SSH password |
 | `local_port` | int | yes | — | Local SOCKS5 port |
+| `bind_ip` | string | no | 127.0.0.1 | Bind address (127.0.0.1 = local only) |
 | `max_reconnects` | int | no | 5 | Reconnect attempts |
 | `ssh_timeout` | int | no | 10 | Connect timeout (sec) |
-
 
 ## Architecture
 
